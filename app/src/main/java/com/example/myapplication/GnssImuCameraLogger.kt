@@ -10,6 +10,7 @@ import android.location.GnssMeasurementRequest
 import android.location.LocationManager
 import android.location.GnssMeasurementsEvent
 import android.hardware.SensorManager
+import android.location.GnssStatus
 import androidx.annotation.RequiresPermission
 import android.os.Handler
 import android.os.HandlerThread
@@ -25,23 +26,39 @@ import java.io.File
 
 class GnssImuCameraLogger(
     private val context: Context,
-    private val lifecycleOwner: LifecycleOwner
+    private val lifecycleOwner: LifecycleOwner,
+    private val onSatellitesUpdated: (String) -> Unit
 ) {
     private lateinit var imageCapture: ImageCapture
+
     private val logger = CSVLogger(
         File(
             context.getExternalFilesDir(null),
             "${System.currentTimeMillis()}.csv"
         ).absolutePath
     )
+
     private val locationManager =
         context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
     private  val sensorManager =
         context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+
     /* Only uncalibrated sensors */
     private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER_UNCALIBRATED)
+
     private val gyroscope = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE_UNCALIBRATED)
+
     private val magnetometer = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD_UNCALIBRATED)
+
+    private val sensorThread = HandlerThread("SensorThread").apply { start() }
+
+    private val sensorHandler = Handler(sensorThread.looper)
+
+    private val sensorExecutor = Executor { command -> sensorHandler.post(command) }
+
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+
     private val acclCallback = object : SensorEventCallback() {
         override fun onSensorChanged(event: SensorEvent) {
             val timestampAcc = event.timestamp
@@ -51,6 +68,7 @@ class GnssImuCameraLogger(
             logger.log("ACCL",timestampAcc,accX,accY,accZ)
         }
     }
+
     private val gyroCallback = object : SensorEventCallback() {
         override fun onSensorChanged(event: SensorEvent) {
             val timestampGyro = event.timestamp
@@ -60,6 +78,7 @@ class GnssImuCameraLogger(
             logger.log("GYRO",timestampGyro,rateX,rateY,rateZ)
         }
     }
+
     private val magnCallback = object : SensorEventCallback() {
         override fun onSensorChanged(event: SensorEvent) {
             val timestampMag = event.timestamp
@@ -69,16 +88,14 @@ class GnssImuCameraLogger(
             logger.log("MAGN",timestampMag,gX,gY,gZ)
         }
     }
-    private val sensorThread = HandlerThread("SensorThread").apply { start() }
-    private val sensorHandler = Handler(sensorThread.looper)
-    private val sensorExecutor = Executor { command -> sensorHandler.post(command) }
-    private var cameraExecutor = Executors.newSingleThreadExecutor()
+
     private val gnssMeasurementsCallback =
         object : GnssMeasurementsEvent.Callback() {
             override fun onGnssMeasurementsReceived(event: GnssMeasurementsEvent) {
                 logger.log("GNSS", event.toString())
             }
         }
+
     private val cameraCallback =
         object : GnssMeasurementsEvent.Callback() {
             override fun onGnssMeasurementsReceived(event: GnssMeasurementsEvent) {
@@ -86,7 +103,15 @@ class GnssImuCameraLogger(
             }
         }
 
-    private val sampleRate = 100
+    private val uiCallback = object : GnssStatus.Callback() {
+        override fun onSatelliteStatusChanged(status: GnssStatus) {
+            onSatellitesUpdated("Спутников: ${status.satelliteCount}")
+        }
+    }
+
+    private val GNSS_INTERVAL_MS = 1000
+
+    private val IMU_SAMPLING_PERIOD_US = 1_000_000
 
     private fun startCameraSync() {
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
@@ -116,24 +141,26 @@ class GnssImuCameraLogger(
     }
 
     @RequiresPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-    fun start() {
+    fun onCreate() {
         startCameraSync()
         locationManager.registerGnssMeasurementsCallback(
             GnssMeasurementRequest.Builder()
                 .setFullTracking(true)
-                .setIntervalMillis(sampleRate)
+                .setIntervalMillis(GNSS_INTERVAL_MS)
                 .build(),
             sensorExecutor,
             gnssMeasurementsCallback
         )
-        locationManager.registerGnssMeasurementsCallback(cameraExecutor, cameraCallback)
-        sensorManager.registerListener(acclCallback, accelerometer, sampleRate,sensorHandler)
-        sensorManager.registerListener(gyroCallback, gyroscope, sampleRate, sensorHandler)
-        sensorManager.registerListener(magnCallback, magnetometer, sampleRate, sensorHandler)
+        locationManager.registerGnssStatusCallback(context.mainExecutor, uiCallback)
+        locationManager.registerGnssMeasurementsCallback(sensorExecutor, cameraCallback)
+        sensorManager.registerListener(acclCallback, accelerometer, IMU_SAMPLING_PERIOD_US,sensorHandler)
+        sensorManager.registerListener(gyroCallback, gyroscope, IMU_SAMPLING_PERIOD_US, sensorHandler)
+        sensorManager.registerListener(magnCallback, magnetometer, IMU_SAMPLING_PERIOD_US, sensorHandler)
     }
 
-    fun stop() {
+    fun onDestroy() {
         locationManager.unregisterGnssMeasurementsCallback(gnssMeasurementsCallback)
+        locationManager.unregisterGnssStatusCallback(uiCallback)
         locationManager.unregisterGnssMeasurementsCallback(cameraCallback)
         sensorManager.unregisterListener(acclCallback)
         sensorManager.unregisterListener(gyroCallback)
